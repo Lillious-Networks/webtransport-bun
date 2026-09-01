@@ -9,9 +9,10 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
     permissions:
       contents: read
-      packages: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -22,8 +23,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: "https://npm.pkg.github.com"
-          scope: "@lillious-networks"
+          registry-url: "https://registry.npmjs.org"
       - name: Install dependencies
         run: bun install --frozen-lockfile
       - name: Download release prebuild assets
@@ -59,9 +59,21 @@ jobs:
         run: |
           cd packages/webtransport
           npm pack --dry-run --ignore-scripts
-      - name: Publish to GitHub Packages
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Preflight npm auth and version availability
+        run: |
+          set -euo pipefail
+          REG="https://registry.npmjs.org"
+          PKG="@lillious-networks/webtransport"
+          PKG_VERSION="$(node -p "require('./packages/webtransport/package.json').version")"
+
+          WHOAMI="$(npm whoami --registry="$REG")"
+          echo "Authenticated to npm as: $WHOAMI"
+
+          if npm view "${PKG}@${PKG_VERSION}" version --registry="$REG" >/dev/null 2>&1; then
+            echo "::error::Version ${PKG_VERSION} is already published for ${PKG}"
+            exit 1
+          fi
+      - name: Publish to npm
         run: |
           cd packages/webtransport
-          npm publish --ignore-scripts --registry=https://npm.pkg.github.com/
+          npm publish --ignore-scripts --access public --registry=https://registry.npmjs.org/

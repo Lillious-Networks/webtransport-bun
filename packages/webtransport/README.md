@@ -6,17 +6,11 @@ Lillious-Networks fork of [`@webtransport-bun/webtransport`](https://github.com/
 
 ## Install
 
-Published to **GitHub Packages**. Add a project `.npmrc`:
-
-```
-@lillious-networks:registry=https://npm.pkg.github.com
-//npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}
-```
-
-Export a GitHub token with `read:packages` as `GITHUB_TOKEN`, then:
-
 ```bash
 bun add @lillious-networks/webtransport
+npm i @lillious-networks/webtransport
+pnpm add @lillious-networks/webtransport
+yarn add @lillious-networks/webtransport
 ```
 
 ## Requirements

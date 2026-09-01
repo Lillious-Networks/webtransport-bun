@@ -49,7 +49,7 @@
 		"x64"
 	],
 	"publishConfig": {
-		"registry": "https://npm.pkg.github.com"
+		"access": "public"
 	},
 	"scripts": {
 		"clean": "bun -e \"import { rm } from 'node:fs/promises'; await rm('dist', { recursive: true, force: true });\"",

@@ -1,13 +1,14 @@
 # Publish Verification Checklist
 
-This fork is published to **GitHub Packages** (`https://npm.pkg.github.com`) as
-`@lillious-networks/webtransport`. Publishing runs in CI via the `publish`
-workflow (`workflow_dispatch`, input = release tag), which downloads the
-prebuilt `.node` binaries from the matching GitHub Release, builds `dist/`, and
-publishes to GitHub Packages using the built-in `GITHUB_TOKEN`.
+This fork is published to **npm** as `@lillious-networks/webtransport`.
+Publishing runs in CI via the `publish` workflow (`workflow_dispatch`, input =
+release tag), which downloads the prebuilt `.node` binaries from the matching
+GitHub Release, builds `dist/`, and publishes with `NPM_TOKEN`
+(a repo secret - an npm automation/publish token for an account with publish
+rights to the package).
 
-Consumers install with a `.npmrc` pointing the `@lillious-networks` scope at
-`https://npm.pkg.github.com` plus a token with `read:packages`.
+Consumers just `bun add @lillious-networks/webtransport` / `npm i ...` - no
+token needed to install (npm allows anonymous reads of public packages).
 
 ## Before tagging a release
 
@@ -30,12 +31,11 @@ Consumers install with a `.npmrc` pointing the `@lillious-networks` scope at
    (linux-x64, darwin-arm64, darwin-x64, win32-x64-msvc) and attaches them,
    plus `SHA256SUMS`, to a GitHub Release.
 3. Run the `publish` workflow manually with the tag as input. It verifies
-   checksums, builds `dist/`, and publishes to GitHub Packages.
+   checksums, builds `dist/`, and publishes to npm.
 
 ## Verify the published package
 
 ```bash
-# with GITHUB_TOKEN (read:packages) exported and a scoped .npmrc:
 mkdir /tmp/wt-test && cd /tmp/wt-test && bun init -y
 bun add @lillious-networks/webtransport@X.Y.Z
 bun -e "import('@lillious-networks/webtransport').then(m=>console.log('OK', Object.keys(m).length))"
