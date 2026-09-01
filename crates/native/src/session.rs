@@ -97,8 +97,16 @@ impl SessionHandle {
 
     #[napi]
     pub async fn send_datagram(&self, data: napi::bindgen_prelude::Buffer) -> Result<()> {
+        // quinn's `send_datagram` is a synchronous enqueue - it does not block
+        // and returns immediately. The old implementation still wrapped it in
+        // `RUNTIME.spawn(...)` + `tokio::time::timeout(...).await`, i.e. a task
+        // allocation, a timer, and a join per datagram. At a few thousand
+        // sessions each pushing movement datagrams that is tens of thousands of
+        // spawns/sec and the tokio scheduler becomes the bottleneck (the
+        // "backpressure" wall). Datagrams are lossy by contract, so there is
+        // nothing to wait on: reserve, send inline, release, done.
         let id = self.id.clone();
-        let bytes = data.as_ref().to_vec();
+        let bytes = data.as_ref();
         let Some((conn, _, metrics, _, _, _, _)) = session_registry::get(&id) else {
             return Err(napi::Error::from_reason("E_SESSION_CLOSED"));
         };
@@ -111,6 +119,10 @@ impl SessionHandle {
             return Err(napi::Error::from_reason("E_QUEUE_FULL"));
         }
         let sz_u64 = sz as u64;
+
+        // Budget reservation is bookkeeping only for a synchronous send: the
+        // bytes leave for quinn's own datagram queue right away, so reserve and
+        // release around the call rather than holding the reservation.
         if let Some(ref sm) = sm {
             if !metrics.try_reserve_queued_bytes_with_session(
                 &sm.queued_bytes,
@@ -121,51 +133,128 @@ impl SessionHandle {
                 return Err(napi::Error::from_reason("E_QUEUE_FULL"));
             }
         }
-        let timeout = tokio::time::Duration::from_millis(limits.backpressure_timeout_ms);
-        let sm_send = sm.clone();
-        let metrics_send = metrics.clone();
-        let send_fut = RUNTIME.spawn(async move {
-            let start = std::time::Instant::now();
-            let result = conn
-                .send_datagram(&bytes)
-                .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"));
-            if let Some(ref sm) = sm_send {
+
+        let start = std::time::Instant::now();
+        let result = conn
+            .send_datagram(bytes)
+            .map_err(|_| napi::Error::from_reason("E_SESSION_CLOSED"));
+
+        if let Some(ref sm) = sm {
+            crate::server_metrics::ServerMetrics::release_session_queued_bytes(
+                &sm.queued_bytes,
+                metrics.as_ref(),
+                sz_u64,
+            );
+        }
+
+        result?;
+        metrics.datagram_enqueue_histogram.observe(start.elapsed());
+        metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
+        if let Some(ref sm) = sm {
+            sm.datagrams_out.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Synchronous, fire-and-forget datagram send. quinn's `send_datagram` is a
+    /// non-blocking enqueue, so there is nothing to await - the old async
+    /// signature cost a Promise + a tokio task hop per call. At high player
+    /// counts the server pushes tens of thousands of movement datagrams per
+    /// second; this removes that per-call overhead from the JS event loop.
+    /// Returns false if the session is gone or the datagram was rejected
+    /// (oversized / queue full); callers treat datagrams as lossy and ignore it.
+    #[napi]
+    pub fn send_datagram_sync(&self, data: napi::bindgen_prelude::Buffer) -> bool {
+        self.send_one_datagram(data.as_ref())
+    }
+
+    /// Batched synchronous send: hand the whole per-session datagram set for one
+    /// flush across the napi boundary in a single call instead of one call per
+    /// datagram. Returns the number successfully enqueued.
+    #[napi]
+    pub fn send_datagrams_sync(&self, datagrams: Vec<napi::bindgen_prelude::Buffer>) -> u32 {
+        let Some((conn, _, metrics, _, _, _, _)) = session_registry::get(&self.id) else {
+            return 0;
+        };
+        let sm = session_registry::get_session_metrics(&self.id);
+        let Some(limits) = session_registry::get_limits(&self.id) else {
+            return 0;
+        };
+        let mut sent: u32 = 0;
+        for buf in &datagrams {
+            let bytes = buf.as_ref();
+            let sz = bytes.len();
+            if sz == 0 || sz > limits.max_datagram_size {
+                continue;
+            }
+            let sz_u64 = sz as u64;
+            if let Some(ref sm) = sm {
+                if !metrics.try_reserve_queued_bytes_with_session(
+                    &sm.queued_bytes,
+                    sz_u64,
+                    limits.max_queued_bytes_global,
+                    limits.max_queued_bytes_per_session,
+                ) {
+                    continue;
+                }
+            }
+            let ok = conn.send_datagram(bytes).is_ok();
+            if let Some(ref sm) = sm {
                 crate::server_metrics::ServerMetrics::release_session_queued_bytes(
                     &sm.queued_bytes,
-                    &metrics_send,
+                    metrics.as_ref(),
                     sz_u64,
                 );
             }
-            result?;
-            metrics_send
-                .datagram_enqueue_histogram
-                .observe(start.elapsed());
-            metrics_send.datagrams_out.fetch_add(1, Ordering::Relaxed);
-            if let Some(ref sm) = sm_send {
-                sm.datagrams_out.fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(())
-        });
-        match tokio::time::timeout(timeout, send_fut).await {
-            Ok(join_res) => join_res
-                .map_err(|e: tokio::task::JoinError| napi::Error::from_reason(e.to_string()))?,
-            Err(_elapsed) => {
+            if ok {
+                sent += 1;
+                metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
                 if let Some(ref sm) = sm {
-                    crate::server_metrics::ServerMetrics::release_session_queued_bytes(
-                        &sm.queued_bytes,
-                        metrics.as_ref(),
-                        sz_u64,
-                    );
+                    sm.datagrams_out.fetch_add(1, Ordering::Relaxed);
                 }
-                metrics
-                    .backpressure_wait_count
-                    .fetch_add(1, Ordering::Relaxed);
-                metrics
-                    .backpressure_timeout_count
-                    .fetch_add(1, Ordering::Relaxed);
-                Err(napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"))
             }
         }
+        sent
+    }
+
+    fn send_one_datagram(&self, bytes: &[u8]) -> bool {
+        let Some((conn, _, metrics, _, _, _, _)) = session_registry::get(&self.id) else {
+            return false;
+        };
+        let sm = session_registry::get_session_metrics(&self.id);
+        let Some(limits) = session_registry::get_limits(&self.id) else {
+            return false;
+        };
+        let sz = bytes.len();
+        if sz == 0 || sz > limits.max_datagram_size {
+            return false;
+        }
+        let sz_u64 = sz as u64;
+        if let Some(ref sm) = sm {
+            if !metrics.try_reserve_queued_bytes_with_session(
+                &sm.queued_bytes,
+                sz_u64,
+                limits.max_queued_bytes_global,
+                limits.max_queued_bytes_per_session,
+            ) {
+                return false;
+            }
+        }
+        let ok = conn.send_datagram(bytes).is_ok();
+        if let Some(ref sm) = sm {
+            crate::server_metrics::ServerMetrics::release_session_queued_bytes(
+                &sm.queued_bytes,
+                metrics.as_ref(),
+                sz_u64,
+            );
+        }
+        if ok {
+            metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
+            if let Some(ref sm) = sm {
+                sm.datagrams_out.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        ok
     }
 
     #[napi]

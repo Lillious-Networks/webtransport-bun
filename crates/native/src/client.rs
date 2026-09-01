@@ -425,6 +425,7 @@ impl ClientSessionHandle {
                 max_global,
                 max_session,
                 max_stream,
+                backpressure_timeout_ms,
             }
         };
 

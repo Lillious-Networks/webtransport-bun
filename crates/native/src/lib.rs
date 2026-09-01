@@ -30,37 +30,72 @@ pub mod spawn_tracked;
 // Global Tokio runtime singleton
 // ---------------------------------------------------------------------------
 
-/// Server runtime: drives the WebTransport server and all server-side stream bridges.
-pub(crate) static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
+/// Resolve the Tokio worker-thread count for a runtime.
+///
+/// `env_var` is checked first (e.g. `WEBTRANSPORT_SERVER_WORKER_THREADS`):
+///   - a positive integer is used as-is
+///   - the literal `auto` uses `std::thread::available_parallelism()`
+///   - anything else (or unset) falls back to `default_threads`
+///
+/// The default is 1, preserving the original single-threaded behaviour unless
+/// explicitly opted out. A single worker thread becomes a hard throughput
+/// ceiling once concurrent sessions saturate it (all sessions share the one
+/// thread), so raising this is how you scale a single process past ~2k
+/// sessions.
+fn resolve_worker_threads(env_var: &str, default_threads: usize) -> usize {
+    match std::env::var(env_var) {
+        Ok(v) => {
+            let v = v.trim();
+            if v.eq_ignore_ascii_case("auto") {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(default_threads)
+            } else {
+                v.parse::<usize>()
+                    .ok()
+                    .filter(|&n| n >= 1)
+                    .unwrap_or(default_threads)
+            }
+        }
+        Err(_) => default_threads,
+    }
+}
+
+fn build_runtime(name: &'static str, worker_threads: usize) -> Runtime {
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
+        .worker_threads(worker_threads)
         .enable_all()
-        .thread_name("wt-server")
+        .thread_name(name)
         .build()
         .unwrap_or_else(|e| {
             eprintln!(
-                "webtransport-native: FATAL E_INTERNAL: failed to create server Tokio runtime: {}",
-                e
+                "webtransport-native: FATAL E_INTERNAL: failed to create {} Tokio runtime: {}",
+                name, e
             );
             std::process::abort();
         })
+}
+
+/// Server runtime: drives the WebTransport server and all server-side stream bridges.
+///
+/// Worker count from `WEBTRANSPORT_SERVER_WORKER_THREADS` (default 1, or `auto`
+/// for one per logical CPU).
+pub(crate) static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
+    build_runtime(
+        "wt-server",
+        resolve_worker_threads("WEBTRANSPORT_SERVER_WORKER_THREADS", 1),
+    )
 });
 
 /// Client runtime: drives client connections and client-side stream bridges.
 /// Isolated from server to avoid same-process deadlock when client+server share a process.
+///
+/// Worker count from `WEBTRANSPORT_CLIENT_WORKER_THREADS` (default 1, or `auto`).
 pub(crate) static CLIENT_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .thread_name("wt-client")
-        .build()
-        .unwrap_or_else(|e| {
-            eprintln!(
-                "webtransport-native: FATAL E_INTERNAL: failed to create client Tokio runtime: {}",
-                e
-            );
-            std::process::abort();
-        })
+    build_runtime(
+        "wt-client",
+        resolve_worker_threads("WEBTRANSPORT_CLIENT_WORKER_THREADS", 1),
+    )
 });
 
 /// Data passed to on_session callback when a session is accepted.
@@ -186,6 +221,19 @@ pub(crate) fn report_channel_closed(context: &str) {
     }
 }
 
+/// A `SessionEvent` (Accepted/Closed/terminal) could not be queued to the JS
+/// side because the batcher channel was full or closed. At high churn this is
+/// expected back-pressure, not a fault, and printing one line per drop floods
+/// the log during load/soak runs. Opt in with WEBTRANSPORT_LOG_DROPPED_EVENTS=1.
+pub(crate) fn log_dropped_session_event(kind: &str, id: &str) {
+    if std::env::var("WEBTRANSPORT_LOG_DROPPED_EVENTS").ok().as_deref() == Some("1") {
+        eprintln!(
+            "webtransport-native: {} session event dropped for id={}",
+            kind, id
+        );
+    }
+}
+
 fn send_startup_result(
     startup_tx: &mut Option<std::sync::mpsc::Sender<std::result::Result<(), String>>>,
     res: std::result::Result<(), String>,
@@ -286,12 +334,13 @@ pub fn client_pool_metrics_snapshot() -> metrics::ClientPoolMetricsSnapshot {
     }
 }
 
-/// Returns the number of Tokio worker threads (should be 1).
+/// Returns the number of Tokio worker threads the server runtime was built with
+/// (1 by default; set `WEBTRANSPORT_SERVER_WORKER_THREADS` to change).
 #[napi]
 pub fn runtime_worker_count() -> u32 {
     panic_guard::catch_panic(|| {
         let _ = &*RUNTIME;
-        Ok(1u32)
+        Ok(resolve_worker_threads("WEBTRANSPORT_SERVER_WORKER_THREADS", 1) as u32)
     })
     .unwrap_or(0)
 }
@@ -581,10 +630,7 @@ pub(crate) fn spawn_wtransport_server(
                                                 }))
                                                 .is_err()
                                             {
-                                                eprintln!(
-                                                    "webtransport-native: session accepted event dropped for id={}",
-                                                    id
-                                                );
+                                                log_dropped_session_event("accepted", &id);
                                             }
                                         }
 
@@ -649,6 +695,7 @@ pub(crate) fn spawn_wtransport_server(
                                                                 max_global: lim_bidi.max_queued_bytes_global,
                                                                 max_session: lim_bidi.max_queued_bytes_per_session,
                                                                 max_stream: lim_bidi.max_queued_bytes_per_stream,
+                                                                backpressure_timeout_ms: lim_bidi.backpressure_timeout_ms,
                                                             };
                                                             let (read_rx, write_tx, stop_tx, write_err_slot, read_err_slot) = crate::client_stream::spawn_bidi_bridge(send, recv, Some(guard), Some(budget.clone()));
                                                             let handle = crate::client_stream::ClientBidiStreamHandle::new_with_budget_and_slot(read_rx, write_tx, stop_tx, Some(budget), write_err_slot, read_err_slot);
@@ -709,6 +756,7 @@ pub(crate) fn spawn_wtransport_server(
                                                                 max_global: lim_uni.max_queued_bytes_global,
                                                                 max_session: lim_uni.max_queued_bytes_per_session,
                                                                 max_stream: lim_uni.max_queued_bytes_per_stream,
+                                                                backpressure_timeout_ms: lim_uni.backpressure_timeout_ms,
                                                             };
                                                             let (read_rx, stop_tx, read_err_slot) = crate::client_stream::spawn_uni_recv_bridge(recv, Some(guard), Some(budget.clone()));
                                                             let handle = crate::client_stream::ClientUniRecvHandle::new_with_budget_and_slot(read_rx, stop_tx, Some(budget), read_err_slot);
@@ -770,6 +818,7 @@ pub(crate) fn spawn_wtransport_server(
                                                                     max_global: lim_create_bi.max_queued_bytes_global,
                                                                     max_session: lim_create_bi.max_queued_bytes_per_session,
                                                                     max_stream: lim_create_bi.max_queued_bytes_per_stream,
+                                                                    backpressure_timeout_ms: lim_create_bi.backpressure_timeout_ms,
                                                                 };
                                                                 let (read_rx, write_tx, stop_tx, write_err_slot, read_err_slot) =
                                                                     crate::client_stream::spawn_bidi_bridge(send, recv, Some(guard), Some(budget.clone()));
@@ -837,6 +886,7 @@ pub(crate) fn spawn_wtransport_server(
                                                                         max_global: lim_create_uni.max_queued_bytes_global,
                                                                         max_session: lim_create_uni.max_queued_bytes_per_session,
                                                                         max_stream: lim_create_uni.max_queued_bytes_per_stream,
+                                                                        backpressure_timeout_ms: lim_create_uni.backpressure_timeout_ms,
                                                                     };
                                                                     let (write_tx, write_err_slot) = crate::client_stream::spawn_uni_send_bridge(send, Some(guard), Some(budget.clone()));
                                                                     let handle = crate::client_stream::ClientUniSendHandle::new_with_budget_and_slot(write_tx, Some(budget), write_err_slot);
@@ -889,10 +939,7 @@ pub(crate) fn spawn_wtransport_server(
                                                                             .try_send(SessionEvent::Closed { id: id.clone(), code: close_code, reason: close_reason })
                                                                             .is_err()
                                                                         {
-                                                                            eprintln!(
-                                                                                "webtransport-native: session closed event dropped for id={}",
-                                                                                id
-                                                                            );
+                                                                            log_dropped_session_event("closed", &id);
                                                                         }
                                                                     }
                                                                     return;
@@ -954,10 +1001,7 @@ pub(crate) fn spawn_wtransport_server(
                                                                     .try_send(SessionEvent::Closed { id: id.clone(), code: close_code, reason: close_reason })
                                                                     .is_err()
                                                                 {
-                                                                    eprintln!(
-                                                                        "webtransport-native: session closed event dropped for id={}",
-                                                                        id
-                                                                    );
+                                                                    log_dropped_session_event("closed", &id);
                                                                 }
                                                             }
                                                             return;
@@ -972,10 +1016,7 @@ pub(crate) fn spawn_wtransport_server(
                                                         .try_send(SessionEvent::Closed { id: id.clone(), code: None, reason: None })
                                                         .is_err()
                                                     {
-                                                        eprintln!(
-                                                            "webtransport-native: terminal session event dropped for id={}",
-                                                            id
-                                                        );
+                                                        log_dropped_session_event("terminal", &id);
                                                     }
                                                 }
                                             },

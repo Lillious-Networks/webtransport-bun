@@ -574,6 +574,10 @@ interface CommonSession {
 
 	// Datagrams
 	sendDatagram(data: Uint8Array): Promise<void>;
+	/** Synchronous fire-and-forget send; returns false if not enqueued. */
+	sendDatagramSync?(data: Uint8Array): boolean;
+	/** Batched synchronous send; returns the count enqueued. */
+	sendDatagramsSync?(datagrams: Uint8Array[]): number;
 	incomingDatagrams(): AsyncIterable<Uint8Array>;
 }
 
@@ -960,6 +964,31 @@ class NativeServerSession implements ServerSession {
 		} catch (err) {
 			throw toWebTransportError(err);
 		}
+	}
+
+	/**
+	 * Synchronous, fire-and-forget datagram send. Datagrams are lossy by
+	 * contract and quinn's enqueue does not block, so there is nothing to
+	 * await - this avoids the Promise + tokio task hop of `sendDatagram`.
+	 * Returns false if the datagram was not enqueued (session gone / oversized
+	 * / queue full).
+	 */
+	sendDatagramSync(data: Uint8Array): boolean {
+		if (this.#closed) return false;
+		const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+		return this.#nativeHandle.sendDatagramSync(buf);
+	}
+
+	/**
+	 * Batched synchronous send - one napi call for the whole set instead of one
+	 * per datagram. Returns how many were enqueued.
+	 */
+	sendDatagramsSync(datagrams: Uint8Array[]): number {
+		if (this.#closed || datagrams.length === 0) return 0;
+		const bufs = datagrams.map((d) =>
+			Buffer.isBuffer(d) ? d : Buffer.from(d),
+		);
+		return this.#nativeHandle.sendDatagramsSync(bufs);
 	}
 
 	async *incomingDatagrams(): AsyncIterable<Uint8Array> {
