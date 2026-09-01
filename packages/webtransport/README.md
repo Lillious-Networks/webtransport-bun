@@ -1,14 +1,22 @@
-# @webtransport-bun/webtransport
+# @lillious-networks/webtransport
 
 Production-focused WebTransport for Bun, Node, and Deno: datagrams + streams, in-process server/client, backed by Rust `wtransport` via `napi-rs`.
 
+Lillious-Networks fork of [`@webtransport-bun/webtransport`](https://github.com/vmeansdev/webtransport-bun) with a configurable multi-threaded native runtime and a synchronous fire-and-forget datagram send path.
+
 ## Install
 
+Published to **GitHub Packages**. Add a project `.npmrc`:
+
+```
+@lillious-networks:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}
+```
+
+Export a GitHub token with `read:packages` as `GITHUB_TOKEN`, then:
+
 ```bash
-bun add @webtransport-bun/webtransport
-npm i @webtransport-bun/webtransport
-pnpm add @webtransport-bun/webtransport
-yarn add @webtransport-bun/webtransport
+bun add @lillious-networks/webtransport
 ```
 
 ## Requirements
@@ -19,7 +27,7 @@ yarn add @webtransport-bun/webtransport
 ## Quick Start
 
 ```ts
-import { createServer, connect } from "@webtransport-bun/webtransport";
+import { createServer, connect } from "@lillious-networks/webtransport";
 
 const server = createServer({
   port: 4433,

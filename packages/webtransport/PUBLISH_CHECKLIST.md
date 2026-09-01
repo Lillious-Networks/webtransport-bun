@@ -1,77 +1,46 @@
 # Publish Verification Checklist
 
-Before publishing to npm, ensure all items pass.
+This fork is published to **GitHub Packages** (`https://npm.pkg.github.com`) as
+`@lillious-networks/webtransport`. Publishing runs in CI via the `publish`
+workflow (`workflow_dispatch`, input = release tag), which downloads the
+prebuilt `.node` binaries from the matching GitHub Release, builds `dist/`, and
+publishes to GitHub Packages using the built-in `GITHUB_TOKEN`.
 
-## 1. Build outputs exist
+Consumers install with a `.npmrc` pointing the `@lillious-networks` scope at
+`https://npm.pkg.github.com` plus a token with `read:packages`.
 
-- [ ] `dist/index.js` exists
-- [ ] `dist/index.d.ts` exists
-- [ ] All referenced dist files exist (errors.js, streams.js, etc.)
+## Before tagging a release
 
-```bash
-npm run clean && npm run build
-ls dist/
-```
+- [ ] `packages/webtransport/package.json` `version` bumped (semver).
+- [ ] `dist/` builds clean:
+  ```bash
+  cd packages/webtransport && bun run clean && bun run build
+  test -f dist/index.js && test -f dist/index.d.ts
+  ```
+- [ ] Native addon builds locally: `bun run build:native` (from repo root)
+- [ ] Tests pass: `bun test`
 
-## 2. Tarball contains required files
+## Release + publish
 
-```bash
-npm run pack:check
-```
+1. Commit, tag `vX.Y.Z` (must equal the package version), push:
+   ```bash
+   git tag vX.Y.Z && git push origin main --tags
+   ```
+2. The `release` workflow builds prebuilds for all targets
+   (linux-x64, darwin-arm64, darwin-x64, win32-x64-msvc) and attaches them,
+   plus `SHA256SUMS`, to a GitHub Release.
+3. Run the `publish` workflow manually with the tag as input. It verifies
+   checksums, builds `dist/`, and publishes to GitHub Packages.
 
-Verify output includes:
-
-- `package/dist/index.js`
-- `package/dist/index.d.ts`
-- `package/prebuilds/webtransport-native.*.node` (darwin-arm64, darwin-x64, linux-x64, win32-x64-msvc as built)
-- `package/README.md`
-- `package/LICENSE`
-
-## 3. Install + import smoke test
-
-```bash
-cd /tmp
-rm -rf wt-pub-test && mkdir wt-pub-test && cd wt-pub-test
-npm init -y
-# From repo: npm i file:/path/to/packages/webtransport
-# Or after pack: npm i /path/to/webtransport-bun-webtransport-0.3.0.tgz
-
-node -e "import('@webtransport-bun/webtransport').then(m=>console.log('OK', Object.keys(m).length))"
-bun -e "import('@webtransport-bun/webtransport').then(m=>console.log('OK', Object.keys(m).length))"
-deno eval --allow-env --allow-read --allow-ffi --allow-net "import('npm:@webtransport-bun/webtransport').then((m)=>console.log('OK', Object.keys(m).length))"
-```
-
-Confirm native addon loads on your OS/arch.
-
-## 4. Platform constraints
-
-- Package has `"os": ["darwin","linux","win32"]` and `"cpu": ["arm64","x64"]`
-- On unsupported platforms, install may succeed but import should fail with a clear native-addon diagnostics message
-
-## 5. Version and access
-
-- Bump version with semver before publish
-- Scoped package: `publishConfig.access: "public"` is set
-
-## Publish command
-
-Preferred from repository root:
+## Verify the published package
 
 ```bash
-npm run release:npm
+# with GITHUB_TOKEN (read:packages) exported and a scoped .npmrc:
+mkdir /tmp/wt-test && cd /tmp/wt-test && bun init -y
+bun add @lillious-networks/webtransport@X.Y.Z
+bun -e "import('@lillious-networks/webtransport').then(m=>console.log('OK', Object.keys(m).length))"
 ```
 
-Manual alternative:
-
-```bash
-cd packages/webtransport
-npm version patch  # or minor/major
-npm publish
-```
-
-## Trusted publisher (no npm token) setup after first publish
-
-1. Publish once manually (command above) to create the npm package.
-2. In npm package settings, add GitHub Actions trusted publisher for this repo/workflow.
-3. In GitHub repository variables, set `NPM_TRUSTED_PUBLISHING=true`.
-4. Use Git tags (`v*`) or the manual publish workflow to publish via CI with provenance.
+Confirm the native addon loads on your OS/arch (`win32-x64`, `linux-x64`,
+`darwin-arm64`, `darwin-x64`). On unsupported platforms install may succeed but
+import fails with a native-addon diagnostics message.

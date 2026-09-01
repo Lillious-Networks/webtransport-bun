@@ -48,7 +48,7 @@ jobs:
           echo "**Operator action:** Instruct users to pin to known-good version:" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
-          echo "bun add @webtransport-bun/webtransport@${VER_NPM}" >> $GITHUB_STEP_SUMMARY
+          echo "bun add @lillious-networks/webtransport@${VER_NPM}" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Validation:** Artifact checksums verified OK." >> $GITHUB_STEP_SUMMARY
