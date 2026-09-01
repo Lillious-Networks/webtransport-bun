@@ -76,13 +76,14 @@ jobs:
           bun-version: "1.3.9"
       - name: Resolve release tag
         id: tag
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             TAG="${{ inputs.tag }}"
-            # Create the tag on the current commit if it doesn't exist yet.
-            if ! git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            # Create the tag on this commit only if it doesn't already exist on
+            # the remote (the shallow CI checkout won't have it locally).
+            if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+              echo "Tag ${TAG} already exists on origin - reusing it."
+            else
               git tag "${TAG}" "${GITHUB_SHA}"
               git push origin "refs/tags/${TAG}"
             fi
